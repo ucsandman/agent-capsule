@@ -598,7 +598,8 @@ function release(outDir, dryRun) {
     '--repo', RELEASE_REPO, '--title', `capsule ${tag}`,
     '--notes', `Claude Code harness capsule packed ${new Date().toISOString()}. Install: bootstrap/install.sh`];
   if (dryRun) { console.log('[dry-run] gh ' + ghArgs.map((a) => (/\s/.test(a) ? JSON.stringify(a) : a)).join(' ')); return; }
-  const r = spawnSync('gh', ghArgs, { stdio: 'inherit', shell: process.platform === 'win32' });
+  // no shell: with shell:true on Windows the --title/--notes values get split on spaces
+  const r = spawnSync(process.platform === 'win32' ? 'gh.exe' : 'gh', ghArgs, { stdio: 'inherit' });
   process.exit(r.status ?? 1);
 }
 // ---------- CLI ----------
