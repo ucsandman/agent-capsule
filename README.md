@@ -104,10 +104,14 @@ node capsule.mjs secrets push Subscription-X-Ray DASHCLAW_API_KEY DASHCLAW_URL
 
 ## A new devbox, end to end
 
-**Precondition:** `install.sh` needs a `capsule.tgz` from somewhere. There is no
-published release yet, so either run `node capsule.mjs release` once first, or
-set `CAPSULE_URL`, or upload the tarball by hand as below. Without one of those
-the script exits 1 by design.
+**Precondition:** `install.sh` needs a `capsule.tgz` from somewhere. A private
+release exists (first one: `capsule-20260903-0600`); refresh it with
+`node capsule.mjs release`. Without a release, `CAPSULE_URL`, or a hand upload
+the script exits 1 by design. The release-download rung was verified 2026-09-03
+on Subscription-X-Ray (`gh repo clone` + `install.sh` -> downloaded, doctor
+36/38). A from-scratch `devbox create --dotfiles ...` could not be verified that
+day: every `devbox create` (any flags) failed server-side with
+`SQLSTATE 40001 could not serialize access`; retry from the CLI or the web UI.
 
 ```
 node capsule.mjs pack --out dist
