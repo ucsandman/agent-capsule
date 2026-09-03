@@ -117,16 +117,16 @@ re-running the doctor to print pass counts before vs after. `apt` needs `--apt`
 `pip --user --break-system-packages`; the last rung is what works on a uv-managed
 PEP 668 interpreter and writes only to the user site dir.
 
-Verified on a Namespace devbox (Ubuntu, node 22, uv-managed python 3.14): doctor
-31/38 before provision, 36/38 after.
+Verified on a Namespace devbox (Ubuntu 24.04, node 22, uv-managed python 3.14):
+doctor 31/38 before provision, 36/38 after, 38/38 with `--apt`.
 
-Two known gaps. `cargo install rtk` is the **wrong** crate (a "Rust Type Kit",
-v0.1.0), so the table pulls `rtk` from the `rtk-ai/rtk` musl release instead,
-whose `--help` says "filter and summarize system outputs". And the two `pwsh`
-hooks still fail: the manifest keeps `apt: ["powershell"]`, but
-`apt-get install powershell` exits 100 ("Unable to locate package") on the stock
-Ubuntu repos. PowerShell needs the Microsoft apt repo added first, which
-`provision` does not do. Treat that step as unsupported until someone adds the repo.
+Two things the table works around. `cargo install rtk` is the **wrong** crate
+(a "Rust Type Kit", v0.1.0), so `rtk` comes from the `rtk-ai/rtk` musl release
+instead, whose `--help` says "filter and summarize system outputs". And stock
+Ubuntu has no `powershell` package (`apt-get install` exits 100), so the apt
+step for it first registers packages.microsoft.com through Microsoft's config
+`.deb` for the box's exact `$ID/$VERSION_ID` (Ubuntu 22.04/24.04, Debian 12),
+then installs. That is the `--apt` step, since it needs sudo.
 
 `~/.local/bin` must be on `PATH` for the doctor to see pip/cargo scripts;
 `provision` prepends it and prints a hint if the login shell lacks it.

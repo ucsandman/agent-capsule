@@ -6,7 +6,7 @@ import os from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { makeFixtureHome } from './fixture.mjs';
-import { rewriteText, isExcludedName, makeRules, loadConfig, parseTarget, doctorHtml } from '../capsule.mjs';
+import { rewriteText, isExcludedName, makeRules, loadConfig, parseTarget, doctorHtml, provisionSteps } from '../capsule.mjs';
 
 const CAPSULE = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'capsule.mjs');
 const TOKEN = '__CAPSULE_HOME__';
@@ -204,6 +204,15 @@ test('secrets push: no configured prefixes refuses to guess a scope', () => {
   assert.equal(r.status, 1);
   assert.match(r.stderr, /no secrets\.defaultPrefixes configured/);
   assert.equal(r.stdout, '', 'must bail before contacting a devbox');
+});
+
+test('provision: the powershell apt step registers the Microsoft repo before installing', () => {
+  const steps = provisionSteps({ apt: ['powershell'] }, '/tmp/x');
+  assert.equal(steps.length, 1);
+  assert.equal(steps[0].needsApt, true);
+  assert.match(steps[0].cmd, /packages-microsoft-prod\.deb[\s\S]*apt-get install -y -qq powershell$/);
+  // a package the stock repos carry gets no setup prefix
+  assert.match(provisionSteps({ apt: ['jq'] }, '/tmp/x')[0].cmd, /^sudo apt-get update/);
 });
 
 test('release: no configured repo exits 1 before packing anything', () => {

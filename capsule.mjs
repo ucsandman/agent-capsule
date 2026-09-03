@@ -25,6 +25,12 @@ const PROVISION_TABLE = {
   'pwsh': { apt: 'powershell' },
   'powershell': { apt: 'powershell' },
 };
+// packages missing from the stock repos: a setup command that registers the vendor repo, run before apt-get install
+const APT_REPO_SETUP = {
+  // Microsoft's config .deb registers packages.microsoft.com for this exact $ID/$VERSION_ID (Ubuntu 22.04/24.04, Debian 12)
+  powershell: '. /etc/os-release && d=$(mktemp -d) && curl -fsSL -o "$d/ms.deb" "https://packages.microsoft.com/config/$ID/$VERSION_ID/packages-microsoft-prod.deb"'
+    + ' && sudo dpkg -i "$d/ms.deb" && rm -rf "$d"',
+};
 // `python3 -m <module>` hooks whose module is not on PyPI ship from a local source tree: config.localPyPackages
 const PYPKG_KEEP = ['src', 'pyproject.toml', 'README.md', 'LICENSE'];
 const PYPKG_SKIP_RE = /[\\/](__pycache__|[^\\/]*\.egg-info)([\\/]|$)|\.pyc$/;
@@ -549,7 +555,8 @@ function provisionSteps(p, claudeDir) {
       `tar xzf "$d/a.tgz" -C "$d"; b=$(find "$d" -type f -name ${g.bin} | head -1); mkdir -p "$HOME/.local/bin"; ` +
       `install -m 755 "$b" "$HOME/.local/bin/${g.bin}"; rm -rf "$d"` });
   for (const pkg of p.apt || []) steps.push({ kind: 'apt', label: pkg, needsApt: true, check: whichCmd(binForInstall('apt', pkg)),
-    cmd: `sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ${pkg}` });
+    cmd: (APT_REPO_SETUP[pkg] ? APT_REPO_SETUP[pkg] + ' && ' : '')
+      + `sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ${pkg}` });
   return steps;
 }
 function provision(targetHome, { dryRun = false, apt = false } = {}) {
@@ -851,4 +858,4 @@ function main(argv) {
 }
 // run the CLI only when executed directly, so importing this module for tests does nothing
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main(process.argv.slice(2));
-export { rewriteText, isExcludedName, scanForSecrets, detectSecretNames, loadConfig, makeRules, parseTarget, doctorHtml };
+export { rewriteText, isExcludedName, scanForSecrets, detectSecretNames, loadConfig, makeRules, parseTarget, doctorHtml, provisionSteps };

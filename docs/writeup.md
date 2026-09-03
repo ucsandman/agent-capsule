@@ -58,10 +58,11 @@ Zero deps. One Node file and the system `tar`.
 | tarball | 4.6 MB |
 | hooks after apply | 31 of 38 pass |
 | hooks after provision | 36 of 38 pass |
+| with `--apt` (sudo) | 38 of 38 pass |
 
-The two that still fail are PowerShell hooks. Stock Ubuntu has no
-`powershell` package, you need the Microsoft apt repo first, and I haven't
-bothered adding that yet.
+The last two are PowerShell hooks. Stock Ubuntu has no `powershell` package,
+so the apt step registers the Microsoft repo first. That one needs sudo, which
+is why it's behind a flag.
 
 A headless Claude Code run on the box came back with my output style, my
 guard hooks and my skills all live.
