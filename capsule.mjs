@@ -67,7 +67,7 @@ function makeRules(home, config = CONFIG) {
     home, claudeHome: path.join(home, '.claude'), agentsHome: path.join(home, '.agents'), externalRoot: root,
     homeRe: new RegExp(parts.map(escapeRegex).join('[\\\\/]{1,2}'), 'gi'),
     gitbashRe: new RegExp(escapeRegex('/' + drive + '/' + parts.slice(1).join('/')), 'gi'),
-    // bare home dir (e.g. C:/Users/sandm/.dashclaw/...) after the .claude-specific passes consumed their matches
+    // bare home dir (e.g. C:/Users/you/.dashclaw/...) after the .claude-specific passes consumed their matches
     bareHomeRe: new RegExp(norm(home).split('/').map(escapeRegex).join('[\\\\/]{1,2}') + '(?=[\\\\/])', 'gi'),
     // <externalRoot>/<repo>/ referenced by settings.json; null externalRoot = no external refs at all
     projectsRe: rootPat ? new RegExp(`${rootPat}[\\\\/]{1,2}([A-Za-z0-9_.-]+)[\\\\/]{1,2}`, 'gi') : null,
@@ -483,6 +483,44 @@ function printDoctor(rows) {
   }
   console.log(`hooks: ${rows.filter(doctorPass).length}/${rows.length} pass`);
 }
+// ---------- doctor --html: the same rows as a self-contained page (no scripts, no assets) ----------
+const HTML_ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+function escapeHtml(s) { return String(s).replace(/[&<>"']/g, (c) => HTML_ESC[c]); }
+function doctorHtml(rows, meta = {}) {
+  const pass = rows.filter(doctorPass).length, all = rows.length;
+  const body = rows.map((r) => {
+    const code = r.code === 2 ? '2 (guard block)' : String(r.code); // 2 = a guard blocking on purpose
+    return `<tr class="${doctorPass(r) ? 'p' : 'f'}"><td>${escapeHtml(r.event)}</td>`
+      + `<td><code>${escapeHtml(r.command)}</code></td><td>${escapeHtml(code)}</td>`
+      + `<td>${escapeHtml(r.stderrLine || '')}</td></tr>`;
+  }).join('\n');
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>capsule doctor</title><style>
+:root{--bg:#fff;--fg:#111;--mut:#5a5a5a;--line:#ddd;--pass:#e8f6ec;--fail:#fdecea;--ok:#1a7f37;--warn:#9a6700}
+@media(prefers-color-scheme:dark){:root{--bg:#0f1115;--fg:#e6e6e6;--mut:#9aa0a6;--line:#2a2f3a;--pass:#14301c;--fail:#3a1a18;--ok:#2ea043;--warn:#d29922}}
+*{box-sizing:border-box}
+body{margin:0;padding:2rem;background:var(--bg);color:var(--fg);font:14px/1.5 ui-sans-serif,system-ui,sans-serif}
+h1{margin:0 0 .25rem;font-size:1.4rem}
+.meta{color:var(--mut);margin-bottom:.75rem}
+.badge{display:inline-block;padding:.25rem .7rem;border-radius:999px;color:#fff;font-weight:600;background:var(--warn)}
+.badge.ok{background:var(--ok)}
+table{border-collapse:collapse;width:100%;margin-top:1rem}
+th,td{border:1px solid var(--line);padding:.4rem .6rem;text-align:left;vertical-align:top}
+th{color:var(--mut);font-weight:600}
+tr.p td{background:var(--pass)}tr.f td{background:var(--fail)}
+code{font:12px/1.4 ui-monospace,Consolas,monospace;word-break:break-all}
+</style></head><body>
+<h1>capsule doctor</h1>
+<div class="meta">home: <code>${escapeHtml(meta.home || '')}</code> &middot; ${escapeHtml(meta.at || new Date().toISOString())}</div>
+<span class="badge${pass === all ? ' ok' : ''}">${pass}/${all} hooks pass</span>
+<table><thead><tr><th>event</th><th>command</th><th>exit</th><th>stderr</th></tr></thead>
+<tbody>
+${body}
+</tbody></table>
+</body></html>
+`;
+}
 // ---------- provision: install what the hooks need. Runs ON the target box, after apply. ----------
 function shOut(cmd, env) {
   const r = spawnSync(cmd, { shell: true, encoding: 'utf8', env, timeout: 30000 });
@@ -605,7 +643,69 @@ function devboxBin() {
   return process.env.DEVBOX_BIN || (process.platform === 'win32'
     ? path.join(HOME, 'AppData', 'Local', 'Programs', 'devbox', 'devbox.exe') : 'devbox');
 }
-function secretsPush(devboxName, wanted, root) {
+// ---------- transport: reach a box either through the Namespace devbox CLI or plain ssh/scp ----------
+// "ssh:HOST" is plain ssh; HOST is whatever your ssh accepts (user@host, or an ssh-config alias).
+// Anything else is a Namespace devbox name.
+function parseTarget(str) {
+  const s = String(str || '').trim();
+  if (s.startsWith('ssh:')) {
+    const name = s.slice(4).trim();
+    if (!name) { console.error('bad target: ssh: needs a host, e.g. ssh:user@host'); process.exit(1); }
+    return { kind: 'ssh', name };
+  }
+  if (!s) { console.error('bad target: expected a devbox name or ssh:HOST'); process.exit(1); }
+  return { kind: 'devbox', name: s };
+}
+// ssh joins its argv with spaces and hands the result to the remote login shell, so the quoting has
+// to survive one extra round-trip before `bash -c` sees it. `~` must never sit inside these quotes.
+function shQuote(s) { return `'${String(s).replace(/'/g, "'\\''")}'`; }
+const posixDir = (rel) => (rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '.');
+// upload(local, remoteRelPath[, mode]): remoteRelPath is relative to the remote HOME. exec(cmd): bash on the box.
+// No shell:true anywhere; --dry-run prints the argv and spawns nothing.
+function makeTransport(target, dryRun = false) {
+  const spawn = (argv, opts = {}) => {
+    if (dryRun) { console.log('[dry-run] ' + argv.join(' ')); return 0; }
+    const r = spawnSync(argv[0], argv.slice(1), { stdio: 'inherit', ...opts });
+    return r.status === null ? 1 : r.status;
+  };
+  const exec = (cmd) => (target.kind === 'ssh'
+    ? spawn(['ssh', target.name, 'bash', '-c', shQuote(cmd)])
+    : spawn([devboxBin(), 'exec', target.name, '--', 'bash', '-c', cmd]));
+  return {
+    kind: target.kind, name: target.name, exec,
+    upload(localPath, remoteRelPath, mode) {
+      const base = path.basename(localPath), dir = posixDir(remoteRelPath);
+      if (target.kind === 'ssh') {
+        // some scp builds read "C:/x/y" as host "C", so run it from the file's own directory and
+        // pass "./<name>" — a form no scp can take for a host, whatever the drive letter
+        const scp = (dest) => spawn(['scp', './' + base, `${target.name}:${dest}`],
+          { cwd: path.dirname(path.resolve(localPath)) });
+        if (!mode) {
+          const st = exec(`mkdir -p ~/${dir}`);
+          return st !== 0 ? st : scp(remoteRelPath);
+        }
+        // a mode means secrets. Land the bytes in a pre-created 0600 staging file (scp leaves an existing
+        // file's mode alone) and only then move it into place, so a failed transfer can never replace a
+        // working destination with a truncated one — same invariant as the devbox path below.
+        let st = exec(`mkdir -p ~/capsule && rm -f ~/capsule/${base} && (umask 077; : > ~/capsule/${base})`);
+        if (st !== 0) return st;
+        st = scp(`capsule/${base}`);
+        if (st !== 0) { exec(`rm -f ~/capsule/${base}`); return st; }
+        return exec(`mkdir -p ~/${dir} && mv ~/capsule/${base} ~/${remoteRelPath} && chmod ${mode} ~/${remoteRelPath}`
+          + ` || { rm -f ~/capsule/${base}; exit 1; }`);
+      }
+      const st = spawn([devboxBin(), 'upload', target.name, '--mkdir', localPath, `capsule/${base}`]);
+      if (st !== 0) return st;
+      // devbox remote paths are workspace-relative; glob so this works on any box, and never leave an
+      // uploaded file inside the workspace checkout when the move fails
+      return exec(`mkdir -p ~/${dir} && mv /workspaces/*/capsule/${base} ~/${remoteRelPath}`
+        + (mode ? ` && chmod ${mode} ~/${remoteRelPath}` : '')
+        + ` || { rm -f /workspaces/*/capsule/${base}; exit 1; }`);
+    },
+  };
+}
+const targetLabel = (t) => (t.kind === 'ssh' ? `ssh:${t.name}` : t.name);
+function secretsPush(target, wanted, root, dryRun = false) {
   // Default scope is the configured prefixes' slice of the detected set — the names this harness authenticates with.
   // The scan also finds unrelated live keys (Stripe/GitHub/Resend/...); those only go over if named explicitly.
   const prefixes = CONFIG.secrets.defaultPrefixes;
@@ -622,23 +722,49 @@ function secretsPush(devboxName, wanted, root) {
   const tmp = path.join(dir, `capsule-secrets-${process.pid}.sh`);
   const body = '#!/usr/bin/env bash\n# generated by `capsule secrets push` — sourced via settings.json env.BASH_ENV\n'
     + names.map((n) => `export ${n}='${String(process.env[n]).replace(/'/g, "'\\''")}'`).join('\n') + '\n';
-  let err = null;
+  const t = makeTransport(target, dryRun);
+  let err = null, landed = false;
   try {
-    fs.writeFileSync(tmp, body, { mode: 0o600 });
-    fs.chmodSync(tmp, 0o600);
-    const up = spawnSync(devboxBin(), ['upload', devboxName, '--mkdir', tmp, 'capsule/load-secrets.sh'], { stdio: 'inherit' });
-    if (up.status !== 0) throw new Error(`devbox upload failed (exit ${up.status})`);
-    // remote path is relative to the workspace dir; glob so this works on any box
-    const mv = spawnSync(devboxBin(), ['exec', devboxName, '--', 'bash', '-c',
-      '(mkdir -p ~/.claude && mv /workspaces/*/capsule/load-secrets.sh ~/.claude/load-secrets.sh && chmod 600 ~/.claude/load-secrets.sh'
-      + ' && bash -n ~/.claude/load-secrets.sh && echo LOAD_SECRETS_OK)'
-      // never leave a secrets file inside the workspace checkout if any step fails
-      + ' || { rm -f /workspaces/*/capsule/load-secrets.sh; exit 1; }'], { stdio: 'inherit' });
-    if (mv.status !== 0) throw new Error(`devbox exec install failed (exit ${mv.status})`);
-  } catch (e) { err = e; } finally { try { fs.rmSync(tmp, { force: true }); } catch { /* ignore */ } }
+    // a dry run never writes real values to disk; the transport prints argv and spawns nothing
+    if (!dryRun) { fs.writeFileSync(tmp, body, { mode: 0o600 }); fs.chmodSync(tmp, 0o600); }
+    const up = t.upload(tmp, '.claude/load-secrets.sh', '600');
+    if (up !== 0) throw new Error(`upload failed (exit ${up})`);
+    landed = true;
+    const chk = t.exec('chmod 600 ~/.claude/load-secrets.sh && bash -n ~/.claude/load-secrets.sh && echo LOAD_SECRETS_OK');
+    if (chk !== 0) throw new Error(`remote install check failed (exit ${chk})`);
+  } catch (e) {
+    err = e;
+    // only a successful upload replaces the destination. A failed one left the box's previous file intact,
+    // and removing it would silently unauthenticate every hook (env.BASH_ENV fails silently when missing).
+    if (landed) t.exec('rm -f ~/.claude/load-secrets.sh');
+  } finally { try { fs.rmSync(tmp, { force: true }); } catch { /* ignore */ } }
   if (err) { console.error(err.message); process.exit(1); }
-  console.log(`pushed ${names.length} names to ${devboxName}:~/.claude/load-secrets.sh (mode 600)`);
+  console.log(`${dryRun ? '[dry-run] would push' : 'pushed'} ${names.length} names to ${targetLabel(target)}:~/.claude/load-secrets.sh (mode 600)`);
   names.forEach((n) => console.log(`  ${n}`)); // names only
+}
+// ---------- deploy: push the capsule + this script + the bootstrap to a box, then run the installer ----------
+function deploy(target, outDir, { force = false, dryRun = false } = {}) {
+  const tgz = path.join(outDir, 'capsule.tgz');
+  if (!fs.existsSync(tgz)) { console.error(`no ${fwd(outDir)}/capsule.tgz — run capsule pack first`); process.exit(1); }
+  const t = makeTransport(target, dryRun), label = targetLabel(target);
+  const send = (local, remote) => {
+    console.log(`[deploy] upload ${path.basename(local)} -> ${label}:~/${remote}`);
+    const st = t.upload(local, remote);
+    if (st !== 0) { console.error(`upload failed (exit ${st}): ${fwd(local)}`); process.exit(1); }
+  };
+  send(tgz, 'capsule/capsule.tgz');
+  send(fileURLToPath(import.meta.url), 'capsule/capsule.mjs');
+  const installer = path.join(SCRIPT_DIR, 'bootstrap', 'install.sh');
+  if (fs.existsSync(installer)) send(installer, 'capsule/bootstrap/install.sh');
+  else console.warn(`no ${fwd(installer)} — skipping the bootstrap upload; run install.sh on the box yourself`);
+  // CAPSULE_DEST stays unset so install.sh uses its own default ($HOME/capsule)
+  const repo = process.env.CAPSULE_REPO || CONFIG.release.repo;
+  const env = [force ? 'CAPSULE_FORCE=1' : '', repo ? `CAPSULE_REPO=${shQuote(repo)}` : ''].filter(Boolean).join(' ');
+  const cmd = `${env}${env ? ' ' : ''}bash ~/capsule/bootstrap/install.sh`;
+  console.log(`[deploy] run ${cmd}`);
+  const st = t.exec(cmd);
+  console.log(`[deploy] install.sh exit ${st}`);
+  process.exit(st);
 }
 // ---------- release: pack, then publish the tarball as a (private) GitHub release asset ----------
 function release(outDir, dryRun) {
@@ -667,8 +793,10 @@ function parseArgs(argv) {
     else if (a === '--home') out.home = argv[++i];
     else if (a === '--stage') out.stage = argv[++i];
     else if (a === '--config') out.config = argv[++i];
+    else if (a === '--html') out.html = argv[++i];
     else if (a === '--dry-run') out.dryRun = true;
     else if (a === '--apt') out.apt = true;
+    else if (a === '--force') out.force = true;
     else out._.push(a);
   }
   return out;
@@ -685,8 +813,15 @@ function main(argv) {
     if (!args._[1]) { console.error('usage: capsule.mjs apply CAPSULE.tgz [--home DIR] [--dry-run]'); process.exit(1); }
     apply(path.resolve(args._[1]), args.home ? path.resolve(args.home) : HOME, !!args.dryRun);
   } else if (cmd === 'doctor') {
-    const rows = runDoctor(args.home ? path.resolve(args.home) : HOME);
+    const home = args.home ? path.resolve(args.home) : HOME;
+    const rows = runDoctor(home);
     printDoctor(rows);
+    if (args.html) {
+      const file = path.resolve(args.html);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, doctorHtml(rows, { home: fwd(home), at: new Date().toISOString() }));
+      console.log(`wrote ${fwd(file)}`);
+    }
     process.exit(rows.every(doctorPass) ? 0 : 1);
   } else if (cmd === 'provision') {
     provision(args.home ? path.resolve(args.home) : HOME, { dryRun: !!args.dryRun, apt: !!args.apt });
@@ -694,18 +829,24 @@ function main(argv) {
     const sub = args._[1] || 'list', root = capsuleScanRoot(args.stage);
     if (sub === 'list') secretsList(root);
     else if (sub === 'push') {
-      if (!args._[2]) { console.error('usage: capsule.mjs secrets push DEVBOX [NAME...]'); process.exit(1); }
-      secretsPush(args._[2], args._.slice(3), root);
-    } else { console.error('usage: capsule.mjs secrets <list|push DEVBOX [NAME...]> [--stage DIR]'); process.exit(1); }
+      if (!args._[2]) { console.error('usage: capsule.mjs secrets push TARGET [NAME...]'); process.exit(1); }
+      secretsPush(parseTarget(args._[2]), args._.slice(3), root, !!args.dryRun);
+    } else { console.error('usage: capsule.mjs secrets <list|push TARGET [NAME...]> [--stage DIR]'); process.exit(1); }
+  } else if (cmd === 'deploy') {
+    if (!args._[1]) { console.error('usage: capsule.mjs deploy TARGET [--out DIR] [--force] [--dry-run]'); process.exit(1); }
+    deploy(parseTarget(args._[1]), path.resolve(args.out || 'dist'), { force: !!args.force, dryRun: !!args.dryRun });
   } else if (cmd === 'release') {
     release(path.resolve(args.out || 'dist'), !!args.dryRun);
   } else {
-    console.error('usage: capsule.mjs <pack [--out DIR] [--home DIR]|apply CAPSULE.tgz [--home DIR] [--dry-run]|doctor [--home DIR]\n'
-      + '                    |provision [--home DIR] [--apt] [--dry-run]|secrets <list|push DEVBOX [NAME...]> [--stage DIR]\n'
-      + '                    |release [--out DIR] [--dry-run]>   [--config capsule.config.json]');
+    console.error('usage: capsule.mjs <pack [--out DIR] [--home DIR]|apply CAPSULE.tgz [--home DIR] [--dry-run]\n'
+      + '                    |doctor [--home DIR] [--html FILE]|provision [--home DIR] [--apt] [--dry-run]\n'
+      + '                    |deploy TARGET [--out DIR] [--force] [--dry-run]\n'
+      + '                    |secrets <list|push TARGET [NAME...]> [--stage DIR] [--dry-run]\n'
+      + '                    |release [--out DIR] [--dry-run]>   [--config capsule.config.json]\n'
+      + '  TARGET: a Namespace devbox name, or ssh:HOST for plain ssh/scp');
     process.exit(1);
   }
 }
 // run the CLI only when executed directly, so importing this module for tests does nothing
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main(process.argv.slice(2));
-export { rewriteText, isExcludedName, scanForSecrets, detectSecretNames, loadConfig, makeRules };
+export { rewriteText, isExcludedName, scanForSecrets, detectSecretNames, loadConfig, makeRules, parseTarget, doctorHtml };

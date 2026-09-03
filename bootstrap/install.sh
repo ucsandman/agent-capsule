@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # agent-capsule bootstrap — idempotent installer for a fresh box.
-#   devbox create <name> --dotfiles https://github.com/ucsandman/agent-capsule --setup_github
+#   devbox create <name> --dotfiles https://github.com/<you>/agent-capsule --setup_github
 # then run this script (Namespace runs dotfiles install.sh automatically when present).
 # Sources for capsule.tgz + capsule.mjs, in order: already in $DEST -> gh release -> $CAPSULE_URL -> dotfiles checkout.
 # The release repo is $CAPSULE_REPO, else release.repo from ../capsule.config.json; with neither, the gh rung is skipped.
@@ -53,7 +53,7 @@ node "$DEST/capsule.mjs" provision ${CAPSULE_APT:+--apt} > "$DEST/provision.log"
 grep -E '^doctor before:' "$DEST/provision.log" || tail -5 "$DEST/provision.log"
 
 # doctor exits 1 whenever any hook fails, which is normal on a box missing optional tools
-node "$DEST/capsule.mjs" doctor > "$DEST/doctor.log" 2>&1 || true
+node "$DEST/capsule.mjs" doctor --html "$DEST/doctor.html" > "$DEST/doctor.log" 2>&1 || true
 echo "[capsule] $(grep -E '^hooks: ' "$DEST/doctor.log" || echo 'doctor produced no summary — see doctor.log')"
-echo "[capsule] logs in $DEST (apply.log, provision.log, doctor.log)"
-echo "[capsule] secrets: run 'capsule secrets push <devbox-name>' from the source machine"
+echo "[capsule] logs in $DEST (apply.log, provision.log, doctor.log); open $DEST/doctor.html for the rendered report"
+echo "[capsule] secrets: run 'capsule secrets push <target>' from the source machine"

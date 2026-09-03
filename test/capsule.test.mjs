@@ -6,11 +6,11 @@ import os from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { makeFixtureHome } from './fixture.mjs';
-import { rewriteText, isExcludedName, makeRules, loadConfig } from '../capsule.mjs';
+import { rewriteText, isExcludedName, makeRules, loadConfig, parseTarget, doctorHtml } from '../capsule.mjs';
 
 const CAPSULE = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'capsule.mjs');
 const TOKEN = '__CAPSULE_HOME__';
-// the committed capsule.config.json is Wes's; every subprocess here gets a generic one instead
+// the committed capsule.config.json is the author's; every subprocess here gets a generic one instead
 const NEUTRAL = { externalRoot: null, localPyPackages: {}, extraExclusions: [], release: { repo: null }, secrets: { defaultPrefixes: [] } };
 const run = (args, env = {}) =>
   spawnSync(process.execPath, [CAPSULE, ...args], { encoding: 'utf8', env: { ...process.env, ...env } });
@@ -211,4 +211,107 @@ test('release: no configured repo exits 1 before packing anything', () => {
   assert.equal(r.status, 1);
   assert.match(r.stderr, /no release repo: set CAPSULE_REPO or release\.repo in capsule\.config\.json/);
   assert.equal(r.stdout.includes('capsule pack summary'), false, 'must not pack before the repo check');
+});
+
+// ---------- (g) targets and deploy ----------
+test('parseTarget: a bare name is a devbox, ssh:HOST is plain ssh, ssh: alone is fatal', () => {
+  assert.deepEqual(parseTarget('my-box'), { kind: 'devbox', name: 'my-box' });
+  assert.deepEqual(parseTarget('ssh:alice@host'), { kind: 'ssh', name: 'alice@host' });
+  // exits the process, so it is exercised through the CLI rather than in-process
+  const r = run(['deploy', 'ssh:', '--dry-run', '--config', NEUTRAL_CFG]);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /ssh: needs a host/);
+});
+
+test('deploy --dry-run (devbox): uploads all three artefacts and runs install.sh', () => {
+  const r = run(['deploy', 'my-box', '--out', OUT, '--dry-run', '--config', NEUTRAL_CFG], { CAPSULE_REPO: 'x/y' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /upload my-box --mkdir .+ capsule\/capsule\.tgz/);
+  assert.match(r.stdout, /mv \/workspaces\/\*\/capsule\/capsule\.tgz ~\/capsule\/capsule\.tgz/);
+  assert.match(r.stdout, /upload my-box --mkdir .+ capsule\/capsule\.mjs/);
+  assert.match(r.stdout, /upload my-box --mkdir .+ capsule\/install\.sh/);
+  assert.match(r.stdout, /mv \/workspaces\/\*\/capsule\/install\.sh ~\/capsule\/bootstrap\/install\.sh/);
+  assert.match(r.stdout, /CAPSULE_REPO='x\/y' bash ~\/capsule\/bootstrap\/install\.sh/);
+  assert.equal(r.stdout.includes('CAPSULE_FORCE=1'), false, 'no --force means no CAPSULE_FORCE');
+});
+
+test('deploy --dry-run (ssh): scp source is drive-letter free and the destination is HOME-relative', () => {
+  const r = run(['deploy', 'ssh:alice@host', '--out', OUT, '--dry-run', '--force', '--config', NEUTRAL_CFG],
+    { CAPSULE_REPO: 'x/y' });
+  assert.equal(r.status, 0, r.stderr);
+  const scp = r.stdout.split('\n').map((l) => l.trim())
+    .find((l) => l.startsWith('[dry-run] scp ') && l.includes('capsule.tgz'));
+  assert.ok(scp, r.stdout);
+  const [, , src, dest] = scp.split(/\s+/);
+  assert.equal(src, './capsule.tgz');
+  assert.equal(/^[A-Za-z]:/.test(src), false, `scp source must carry no drive prefix: ${src}`);
+  assert.equal(dest, 'alice@host:capsule/capsule.tgz');
+  assert.match(r.stdout, /ssh alice@host bash -c 'mkdir -p ~\/capsule'/);
+  assert.ok(r.stdout.includes('alice@host:capsule/capsule.mjs'), r.stdout);
+  assert.ok(r.stdout.includes('alice@host:capsule/bootstrap/install.sh'), r.stdout);
+  assert.ok(r.stdout.includes('CAPSULE_FORCE=1'), r.stdout);
+  assert.ok(r.stdout.includes('x/y') && r.stdout.includes('CAPSULE_REPO='), r.stdout);
+  assert.match(r.stdout, /bash ~\/capsule\/bootstrap\/install\.sh/);
+});
+
+test('deploy: a missing capsule.tgz is a one-line fatal error', () => {
+  const r = run(['deploy', 'my-box', '--out', path.join(TMP, 'no-such-out'), '--dry-run', '--config', NEUTRAL_CFG]);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /capsule\.tgz — run capsule pack first/);
+});
+
+// ---------- (h) doctor --html ----------
+test('doctorHtml: escapes every value and reports the pass ratio', () => {
+  const rows = [
+    { event: 'SessionStart', command: 'node ok.cjs', code: 0, stderrLine: '' },
+    { event: 'PreToolUse', command: 'echo "<script>alert(1)</script>"', code: 1, stderrLine: 'boom' },
+  ];
+  const html = doctorHtml(rows, { home: '/home/alice', at: '2026-01-01T00:00:00.000Z' });
+  assert.ok(html.includes('capsule doctor'), html.slice(0, 200));
+  assert.ok(html.includes('1/2 hooks pass'), html);
+  assert.ok(html.includes('&lt;script&gt;'), html);
+  assert.equal(html.includes('<script>'), false, 'no raw script tag may survive escaping');
+  assert.ok(html.includes('SessionStart') && html.includes('PreToolUse'), html);
+});
+
+test('doctor --html writes a self-contained report for an applied target', () => {
+  const target = path.join(TMP, 'target'); // created by the apply test above
+  assert.ok(fs.existsSync(path.join(target, '.claude', 'settings.json')), 'the apply test must have run first');
+  const file = path.join(TMP, 'doctor-report.html');
+  // exit code is 0 or 1 depending on whether python3 exists on this runner, so it is not asserted
+  run(['doctor', '--home', target, '--html', file, '--config', NEUTRAL_CFG]);
+  assert.ok(fs.existsSync(file), 'doctor --html must write the file');
+  const html = fs.readFileSync(file, 'utf8');
+  assert.ok(html.includes('capsule doctor'), html.slice(0, 200));
+  assert.ok(html.includes('hooks pass'), html.slice(0, 2000));
+  assert.ok(html.includes('hello.cjs'), html.slice(0, 4000));
+});
+
+test('secrets push --dry-run: no value reaches stdout and no temp file survives', () => {
+  const cfg = path.join(TMP, 'capt.json'), scratch = path.join(TMP, 'scratch');
+  fs.mkdirSync(scratch, { recursive: true });
+  fs.writeFileSync(cfg, JSON.stringify({ ...NEUTRAL, secrets: { defaultPrefixes: ['CAPT_'] } }));
+  // a stage whose settings.json names the secret, so detectSecretNames finds it without a real hook tree
+  const stage = path.join(TMP, 'capt-stage');
+  fs.mkdirSync(stage, { recursive: true });
+  fs.writeFileSync(path.join(stage, 'settings.json'), JSON.stringify({ env: { CAPT_X: '' } }));
+  const value = 'capsule-test-secret-value-do-not-log';
+  const r = run(['secrets', 'push', 'ssh:alice@host', '--dry-run', '--config', cfg, '--stage', stage],
+    { CAPT_X: value, CAPSULE_SCRATCH: scratch });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout.includes(value), false, 'a secret value must never reach stdout');
+  assert.equal(r.stderr.includes(value), false, 'a secret value must never reach stderr');
+  assert.ok(r.stdout.includes('CAPT_X'), r.stdout); // the name does go out
+  // the 0600 staging file is created before any bytes land, and the destination is replaced by a mv
+  assert.match(r.stdout, /umask 077; : > ~\/capsule\/capsule-secrets-\d+\.sh/);
+  assert.match(r.stdout, /mv ~\/capsule\/capsule-secrets-\d+\.sh ~\/\.claude\/load-secrets\.sh && chmod 600/);
+  assert.match(r.stdout, /bash -n ~\/\.claude\/load-secrets\.sh && echo LOAD_SECRETS_OK/);
+  assert.deepEqual(fs.readdirSync(scratch), [], 'a dry run must leave no temp file behind');
+});
+
+test('doctorHtml: exit 2 is a pass, labelled as a guard block', () => {
+  const html = doctorHtml([{ event: 'PreToolUse', command: 'guard.cjs', code: 2, stderrLine: 'blocked' }], {});
+  assert.ok(html.includes('1/1 hooks pass'), html);
+  assert.ok(html.includes('2 (guard block)'), html);
+  assert.ok(html.includes('class="badge ok"'), html);
 });
