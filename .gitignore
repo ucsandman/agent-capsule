@@ -1,0 +1,5 @@
+dist/
+*.tgz
+.dashclaw-local/
+.offlocal/
+node_modules/
