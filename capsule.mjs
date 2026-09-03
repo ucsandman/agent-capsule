@@ -801,9 +801,16 @@ function parseArgs(argv) {
   }
   return out;
 }
+const USAGE = 'usage: capsule.mjs <pack [--out DIR] [--home DIR]|apply CAPSULE.tgz [--home DIR] [--dry-run]\n'
+  + '                    |doctor [--home DIR] [--html FILE]|provision [--home DIR] [--apt] [--dry-run]\n'
+  + '                    |deploy TARGET [--out DIR] [--force] [--dry-run]\n'
+  + '                    |secrets <list|push TARGET [NAME...]> [--stage DIR] [--dry-run]\n'
+  + '                    |release [--out DIR] [--dry-run]|help>   [--config capsule.config.json]\n'
+  + '  TARGET: a Namespace devbox name, or ssh:HOST for plain ssh/scp';
 function main(argv) {
   const args = parseArgs(argv);
   const cmd = args._[0];
+  if (cmd === 'help' || cmd === '--help' || cmd === '-h') { console.log(USAGE); process.exit(0); }
   if (args.config) { CONFIG = loadConfig(path.resolve(args.config)); RULES = makeRules(HOME, CONFIG); }
   if (cmd === 'pack') {
     // --home is the SOURCE home being packed; it defaults to ours
@@ -838,12 +845,7 @@ function main(argv) {
   } else if (cmd === 'release') {
     release(path.resolve(args.out || 'dist'), !!args.dryRun);
   } else {
-    console.error('usage: capsule.mjs <pack [--out DIR] [--home DIR]|apply CAPSULE.tgz [--home DIR] [--dry-run]\n'
-      + '                    |doctor [--home DIR] [--html FILE]|provision [--home DIR] [--apt] [--dry-run]\n'
-      + '                    |deploy TARGET [--out DIR] [--force] [--dry-run]\n'
-      + '                    |secrets <list|push TARGET [NAME...]> [--stage DIR] [--dry-run]\n'
-      + '                    |release [--out DIR] [--dry-run]>   [--config capsule.config.json]\n'
-      + '  TARGET: a Namespace devbox name, or ssh:HOST for plain ssh/scp');
+    console.error(USAGE);
     process.exit(1);
   }
 }

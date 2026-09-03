@@ -6,7 +6,8 @@ call into. Secrets never ride inside the tarball: they go over separately
 as a mode-0600 `load-secrets.sh`, and every staged text file is secret-scanned
 first, so a stray key deletes the stage instead of shipping.
 
-Zero deps: Node 20+ builtins + system `tar`.
+Zero deps: Node 20+ builtins + system `tar`. The story behind it, and the
+list of things that bit along the way, is in [docs/writeup.md](docs/writeup.md).
 ```
 node capsule.mjs pack [--out DIR]                              # default: ./dist
 node capsule.mjs apply CAPSULE.tgz [--home DIR] [--dry-run]
