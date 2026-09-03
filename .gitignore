@@ -3,3 +3,5 @@ dist/
 .dashclaw-local/
 .offlocal/
 node_modules/
+.handoff-notes-*.md
+dist-*/

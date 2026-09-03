@@ -5,13 +5,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { spawnSync } from 'node:child_process';
+import { pathToFileURL, fileURLToPath } from 'node:url';
+// the *target* home for apply/doctor/provision/secrets; pack's *source* home comes from RULES (see makeRules)
 const HOME = os.homedir();
-const CLAUDE_HOME = path.join(HOME, '.claude');
-const AGENTS_HOME = path.join(HOME, '.agents');
 const TOKEN = '__CAPSULE_HOME__';
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 const MANIFEST_NAME = '.capsule-manifest.json';
-const RELEASE_REPO = process.env.CAPSULE_REPO || 'ucsandman/agent-capsule';
 // where `secrets push` writes its short-lived 0600 file; set CAPSULE_SCRATCH to keep it off the system temp dir
 const SCRATCH_DIR = process.env.CAPSULE_SCRATCH || os.tmpdir();
 const TOP_LEVEL_FILES = ['CLAUDE.md', 'AGENTS.md', 'agnostic-rules.md', 'SOUL.md', 'RTK.md', 'keybindings.json'];
@@ -26,20 +25,57 @@ const PROVISION_TABLE = {
   'pwsh': { apt: 'powershell' },
   'powershell': { apt: 'powershell' },
 };
-// `python3 -m <module>` hooks whose module is not on PyPI and ships from a local source tree instead
-const LOCAL_PY_PACKAGES = {
-  context_handoff_bundle: { name: 'context-handoff-bundle', src: path.join(HOME, 'clawd', 'projects', 'context-handoff-bundle') },
-};
+// `python3 -m <module>` hooks whose module is not on PyPI ship from a local source tree: config.localPyPackages
 const PYPKG_KEEP = ['src', 'pyproject.toml', 'README.md', 'LICENSE'];
 const PYPKG_SKIP_RE = /[\\/](__pycache__|[^\\/]*\.egg-info)([\\/]|$)|\.pyc$/;
 // ---------- path / text helpers ----------
 function fwd(p) { return p.split(path.sep).join('/'); }
 function escapeRegex(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
-function underHome(p) {
-  const rp = path.resolve(p).toLowerCase(), hp = path.resolve(HOME).toLowerCase();
+function underHome(p, home = RULES.home) {
+  const rp = path.resolve(p).toLowerCase(), hp = path.resolve(home).toLowerCase();
   return rp === hp || rp.startsWith(hp + path.sep.toLowerCase());
 }
 function redact(s) { return String(s).slice(0, 4) + '***'; }
+// ---------- config: every machine-specific value lives in capsule.config.json, never in this file ----------
+const DEFAULT_CONFIG = { externalRoot: null, localPyPackages: {}, extraExclusions: [], release: { repo: null }, secrets: { defaultPrefixes: [] } };
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+// order: --config PATH -> $CAPSULE_CONFIG -> capsule.config.json beside this script -> generic defaults
+function loadConfig(explicit) {
+  const file = explicit || process.env.CAPSULE_CONFIG || path.join(SCRIPT_DIR, 'capsule.config.json');
+  if (!fs.existsSync(file)) return structuredClone(DEFAULT_CONFIG);
+  const die = (msg) => { console.error(`bad config ${fwd(file)}: ${msg}`); process.exit(1); };
+  let raw;
+  try { raw = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { die(e.message); }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) die('expected a JSON object');
+  const unknown = Object.keys(raw).filter((k) => !(k in DEFAULT_CONFIG));
+  if (unknown.length) die(`unknown key(s): ${unknown.join(', ')}`);
+  const c = { ...structuredClone(DEFAULT_CONFIG), ...raw,
+    release: { ...DEFAULT_CONFIG.release, ...raw.release }, secrets: { ...DEFAULT_CONFIG.secrets, ...raw.secrets } };
+  c.localPyPackages = Object.fromEntries(Object.entries(c.localPyPackages)
+    .map(([k, v]) => [k, { ...v, src: v.src?.startsWith('~/') ? path.join(HOME, v.src.slice(2)) : v.src }]));
+  return c;
+}
+// every home-derived path and regex in one object, so `pack --home DIR` can pack a home that is not ours
+function makeRules(home, config = CONFIG) {
+  // both separators, so a Windows-style home still yields the right regexes when this runs on Linux
+  const norm = (p) => String(p).replace(/[\\/]+/g, '/').replace(/\/$/, '');
+  const parts = norm(path.join(home, '.claude')).split('/');
+  const drive = parts[0].replace(':', '').toLowerCase();
+  const root = config.externalRoot ? String(config.externalRoot).replace(/\\/g, '/').replace(/\/+$/, '') : null;
+  const rootPat = root && root.split('/').map(escapeRegex).join('[\\\\/]{1,2}');
+  return {
+    home, claudeHome: path.join(home, '.claude'), agentsHome: path.join(home, '.agents'), externalRoot: root,
+    homeRe: new RegExp(parts.map(escapeRegex).join('[\\\\/]{1,2}'), 'gi'),
+    gitbashRe: new RegExp(escapeRegex('/' + drive + '/' + parts.slice(1).join('/')), 'gi'),
+    // bare home dir (e.g. C:/Users/sandm/.dashclaw/...) after the .claude-specific passes consumed their matches
+    bareHomeRe: new RegExp(norm(home).split('/').map(escapeRegex).join('[\\\\/]{1,2}') + '(?=[\\\\/])', 'gi'),
+    // <externalRoot>/<repo>/ referenced by settings.json; null externalRoot = no external refs at all
+    projectsRe: rootPat ? new RegExp(`${rootPat}[\\\\/]{1,2}([A-Za-z0-9_.-]+)[\\\\/]{1,2}`, 'gi') : null,
+    extRefRe: rootPat ? new RegExp(`${rootPat}[\\\\/]{1,2}([A-Za-z0-9_.-]+)[\\\\/]{1,2}([^\\s"']+\\.(?:py|cjs|mjs|js|ps1))`, 'gi') : null,
+  };
+}
+let CONFIG = loadConfig();
+let RULES = makeRules(HOME, CONFIG);
 // ---------- exclusion rules (whitelist of what to walk, this filters within it) ----------
 const EXACT_NAMES = new Set([
   '__pycache__', 'cache', 'debug', 'logs', 'telemetry', 'session-env', 'session-data', 'paste-cache',
@@ -47,14 +83,15 @@ const EXACT_NAMES = new Set([
   'opus-handoff-injected', 'meditations', 'ide', 'chrome', 'file-history', 'downloads', 'homunculus',
   'backups', 'history.jsonl', 'corrections.jsonl', 'stats-cache.json', 'mcp-health-cache.json',
   '%systemdrive%', '--full-page', 'keys', 'load-secrets.sh', '.secrets.env', '.env',
-  'node_modules', 'tests', 'fleet', 'superpowers',
+  'node_modules',
 ]);
 const PREFIX_NAMES = ['backups-', 'error-log', 'daemon'];
 const CODE_EXTS = new Set(['.cjs', '.js', '.mjs', '.py', '.ps1', '.vbs']);
 const SOFT_SUBSTRINGS = ['token', 'credential', 'creds']; // only applied to non-code files
-function isExcludedName(name) {
+function isExcludedName(name, extras = CONFIG.extraExclusions) {
   const lower = name.toLowerCase();
   if (EXACT_NAMES.has(lower) || lower.includes('.bak')) return true;
+  if (extras.some((e) => String(e).toLowerCase() === lower)) return true;
   if (/^\.env(\..+)?$/.test(lower)) return true;
   if (lower.endsWith('.pem') || lower.endsWith('.key')) return true;
   if (PREFIX_NAMES.some((p) => lower.startsWith(p))) return true;
@@ -70,7 +107,7 @@ function copyTree(srcAbs, destAbs, log) {
     let real;
     try { real = fs.realpathSync(srcAbs); } catch { console.warn(`skip broken symlink: ${fwd(srcAbs)}`); return; }
     if (!underHome(real)) { console.warn(`skip symlink out of HOME: ${fwd(srcAbs)} -> ${fwd(real)}`); return; }
-    log?.push(`dereferenced symlink ${fwd(path.relative(CLAUDE_HOME, srcAbs))} -> ${fwd(real)}`);
+    log?.push(`dereferenced symlink ${fwd(path.relative(RULES.claudeHome, srcAbs))} -> ${fwd(real)}`);
     srcAbs = real; st = fs.statSync(real);
   }
   if (st.isDirectory()) {
@@ -82,6 +119,15 @@ function copyTree(srcAbs, destAbs, log) {
     fs.copyFileSync(srcAbs, destAbs);
   }
 }
+// --force-local is GNU-only; bsdtar (Windows' built-in tar.exe) rejects it outright. Detect once.
+let tarForceLocal = null;
+function tarArgs(rest) {
+  if (tarForceLocal === null) {
+    const v = spawnSync('tar', ['--version'], { encoding: 'utf8' });
+    tarForceLocal = /GNU tar/.test((v.stdout || '') + (v.stderr || ''));
+  }
+  return tarForceLocal ? ['--force-local', ...rest] : rest;
+}
 function walkDir(root, fn, dir = root) {
   for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
     const abs = path.join(dir, e.name);
@@ -90,28 +136,23 @@ function walkDir(root, fn, dir = root) {
   }
 }
 // ---------- __CAPSULE_HOME__ / interpreter rewrite ----------
-const homeParts = fwd(CLAUDE_HOME).split('/');
-const HOME_RE = new RegExp(homeParts.map(escapeRegex).join('[\\\\/]{1,2}'), 'gi');
-const driveLetter = homeParts[0].replace(':', '').toLowerCase();
-const GITBASH_RE = new RegExp(escapeRegex('/' + driveLetter + '/' + homeParts.slice(1).join('/')), 'gi');
-const PROJECTS_RE = /[A-Za-z]:[\\/]{1,2}Projects[\\/]{1,2}([A-Za-z0-9_.-]+)[\\/]{1,2}/gi;
-// bare home dir (e.g. C:/Users/sandm/.dashclaw/...) after the .claude-specific passes have consumed their matches
-const BARE_HOME_RE = new RegExp(fwd(HOME).split('/').map(escapeRegex).join('[\\\\/]{1,2}') + '(?=[\\\\/])', 'gi');
-function rewriteText(s, { interpreters = false } = {}) {
+function rewriteText(s, { interpreters = false } = {}, rules = RULES) {
   let count = 0;
-  let out = s.replace(HOME_RE, () => { count++; return TOKEN + '/.claude'; });
-  out = out.replace(GITBASH_RE, () => { count++; return TOKEN + '/.claude'; });
-  out = out.replace(PROJECTS_RE, (m, repo) => { count++; return `${TOKEN}/.claude/ext/${repo}/`; });
-  out = out.replace(BARE_HOME_RE, () => { count++; return TOKEN; });
+  let out = s.replace(rules.homeRe, () => { count++; return TOKEN + '/.claude'; });
+  out = out.replace(rules.gitbashRe, () => { count++; return TOKEN + '/.claude'; });
+  if (rules.projectsRe) out = out.replace(rules.projectsRe, (m, repo) => { count++; return `${TOKEN}/.claude/ext/${repo}/`; });
+  out = out.replace(rules.bareHomeRe, () => { count++; return TOKEN; });
   if (interpreters) {
     out = out.replace(/\bpy -3\.12\b/g, () => { count++; return 'python3'; });
     out = out.replace(/(^|[\s"])python(?!3)(\s+)/g, (m, pre, ws) => { count++; return `${pre}python3${ws}`; });
   }
   return [out, count];
 }
-// ---------- external hook source discovery (C:/Projects/<repo>/... referenced by settings.json) ----------
+// ---------- external hook source discovery (<externalRoot>/<repo>/... referenced by settings.json) ----------
 function extractExternalRefs(cmd) {
-  const re = /[A-Za-z]:[\\/]{1,2}Projects[\\/]{1,2}([A-Za-z0-9_.-]+)[\\/]{1,2}([^\s"']+\.(?:py|cjs|mjs|js|ps1))/gi;
+  const re = RULES.extRefRe;
+  if (!re) return []; // no externalRoot configured: nothing outside the home is ever pulled in
+  re.lastIndex = 0; // the regex is shared across calls, so exec() state must not leak between commands
   const out = []; let m;
   while ((m = re.exec(cmd))) out.push({ repo: m[1], relPath: m[2].replace(/\\/g, '/') });
   return out;
@@ -119,7 +160,8 @@ function extractExternalRefs(cmd) {
 function copyExternalFile(stageDir, repo, relPath, copiedSet) {
   const key = `${repo}/${relPath}`;
   if (copiedSet.has(key)) return;
-  const absSrc = `C:/Projects/${repo}/${relPath}`;
+  const repoRoot = `${RULES.externalRoot}/${repo}`;
+  const absSrc = `${repoRoot}/${relPath}`;
   if (!fs.existsSync(absSrc)) { console.warn(`external hook missing on disk: ${absSrc}`); return; }
   if (fs.statSync(absSrc).size > MAX_FILE_BYTES) { console.warn(`skip oversized external file: ${absSrc}`); return; }
   const destAbs = path.join(stageDir, 'ext', repo, relPath);
@@ -130,9 +172,9 @@ function copyExternalFile(stageDir, repo, relPath, copiedSet) {
   const content = fs.readFileSync(absSrc, 'utf8'), dir = path.dirname(relPath);
   for (const m of content.matchAll(/^\s*(?:from|import)\s+([A-Za-z_][A-Za-z0-9_]*)\b/gm)) {
     const siblingRel = (dir === '.' ? '' : dir + '/') + m[1] + '.py';
-    if (fs.existsSync(`C:/Projects/${repo}/${siblingRel}`)) copyExternalFile(stageDir, repo, siblingRel, copiedSet);
+    if (fs.existsSync(`${repoRoot}/${siblingRel}`)) copyExternalFile(stageDir, repo, siblingRel, copiedSet);
     // sibling package directory (e.g. hooks/dashclaw_agent_intel/): copy whole package, skip caches/tests
-    const pkgRel = (dir === '.' ? '' : dir + '/') + m[1], pkgAbs = `C:/Projects/${repo}/${pkgRel}`;
+    const pkgRel = (dir === '.' ? '' : dir + '/') + m[1], pkgAbs = `${repoRoot}/${pkgRel}`;
     if (fs.existsSync(path.join(pkgAbs, '__init__.py')) && !copiedSet.has(`${repo}/${pkgRel}/`)) {
       copiedSet.add(`${repo}/${pkgRel}/`);
       fs.cpSync(pkgAbs, path.join(stageDir, 'ext', repo, pkgRel), { recursive: true,
@@ -142,7 +184,7 @@ function copyExternalFile(stageDir, repo, relPath, copiedSet) {
 }
 // ---------- settings.json processing ----------
 function stageSettings(stageDir) {
-  const original = JSON.parse(fs.readFileSync(path.join(CLAUDE_HOME, 'settings.json'), 'utf8'));
+  const original = JSON.parse(fs.readFileSync(path.join(RULES.claudeHome, 'settings.json'), 'utf8'));
   const hooksManifest = [], dropped = [], externalRepos = new Set(), copiedExt = new Set();
   let rewrittenCount = 0;
   const newHooks = {};
@@ -172,8 +214,8 @@ function stageSettings(stageDir) {
   let statusLine = original.statusLine, notes = [];
   if (statusLine && typeof statusLine.command === 'string') {
     const quoted = statusLine.command.match(/"([^"]+)"/);
-    if (quoted && quoted[1].toLowerCase().startsWith(CLAUDE_HOME.toLowerCase())) {
-      copyTree(quoted[1], path.join(stageDir, path.relative(CLAUDE_HOME, quoted[1])));
+    if (quoted && quoted[1].toLowerCase().startsWith(RULES.claudeHome.toLowerCase())) {
+      copyTree(quoted[1], path.join(stageDir, path.relative(RULES.claudeHome, quoted[1])));
     } else if (quoted) {
       notes.push(`note: statusLine target (${quoted[1]}) is outside ~/.claude and was not packed`);
     }
@@ -222,7 +264,7 @@ function deriveProvision(stageDir, binaries, hooks) {
     if (m) modules.add(m[1].split('.')[0]);
   }
   for (const mod of modules) {
-    const pkg = LOCAL_PY_PACKAGES[mod];
+    const pkg = CONFIG.localPyPackages[mod];
     const rel = pkg ? stagePyPackage(stageDir, pkg) : null;
     if (rel) push(p.pip_local, rel); else push(p.manual, mod);
   }
@@ -277,18 +319,18 @@ function pack(outDir) {
   const stageDir = path.join(outDir, 'stage');
   fs.mkdirSync(stageDir, { recursive: true });
   const symlinkLog = [];
-  for (const f of TOP_LEVEL_FILES) copyTree(path.join(CLAUDE_HOME, f), path.join(stageDir, f), symlinkLog);
-  for (const d of TOP_LEVEL_DIRS) copyTree(path.join(CLAUDE_HOME, d), path.join(stageDir, d), symlinkLog);
+  for (const f of TOP_LEVEL_FILES) copyTree(path.join(RULES.claudeHome, f), path.join(stageDir, f), symlinkLog);
+  for (const d of TOP_LEVEL_DIRS) copyTree(path.join(RULES.claudeHome, d), path.join(stageDir, d), symlinkLog);
   symlinkLog.forEach((l) => console.log(l));
   // plugins/: top-level files only, never recurse into cache/repos/marketplaces/data/auto-docs
-  const pluginsDir = path.join(CLAUDE_HOME, 'plugins');
+  const pluginsDir = path.join(RULES.claudeHome, 'plugins');
   if (fs.existsSync(pluginsDir)) {
     for (const e of fs.readdirSync(pluginsDir, { withFileTypes: true })) {
       if (e.isFile()) copyTree(path.join(pluginsDir, e.name), path.join(stageDir, 'plugins', e.name));
     }
   }
   // projects/*/memory only
-  const projectsDir = path.join(CLAUDE_HOME, 'projects');
+  const projectsDir = path.join(RULES.claudeHome, 'projects');
   if (fs.existsSync(projectsDir)) {
     for (const e of fs.readdirSync(projectsDir, { withFileTypes: true })) {
       const memSrc = path.join(projectsDir, e.name, 'memory');
@@ -296,7 +338,7 @@ function pack(outDir) {
     }
   }
   // ~/.agents/memory -> agents-memory/
-  const agentsMemSrc = path.join(AGENTS_HOME, 'memory');
+  const agentsMemSrc = path.join(RULES.agentsHome, 'memory');
   if (fs.existsSync(agentsMemSrc)) copyTree(agentsMemSrc, path.join(stageDir, 'agents-memory'));
   const settingsResult = stageSettings(stageDir);
   const provision = deriveProvision(stageDir, settingsResult.binaries, settingsResult.hooksManifest);
@@ -317,7 +359,7 @@ function pack(outDir) {
   const files = []; let bytes = 0;
   walkDir(stageDir, (abs, rel) => { files.push(rel); bytes += fs.statSync(abs).size; });
   const manifest = {
-    version: 1, packedAt: new Date().toISOString(), sourceOS: process.platform, sourceHome: fwd(HOME),
+    version: 1, packedAt: new Date().toISOString(), sourceOS: process.platform, sourceHome: fwd(RULES.home),
     files: files.sort(), bytes,
     hooks: settingsResult.hooksManifest, binaries: settingsResult.binaries, external: settingsResult.external,
     dropped: settingsResult.dropped,
@@ -328,7 +370,7 @@ function pack(outDir) {
   fs.writeFileSync(path.join(outDir, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
   fs.writeFileSync(path.join(stageDir, MANIFEST_NAME), JSON.stringify(manifest, null, 2) + '\n');
   const tgzPath = path.join(outDir, 'capsule.tgz');
-  const tar = spawnSync('tar', ['--force-local', '-czf', fwd(tgzPath), '-C', fwd(stageDir), '.'], { stdio: 'inherit' });
+  const tar = spawnSync('tar', tarArgs(['-czf', fwd(tgzPath), '-C', fwd(stageDir), '.']), { stdio: 'inherit' });
   if (tar.status !== 0) { console.error('tar failed'); process.exit(1); }
   console.log('--- capsule pack summary ---');
   console.log(`files: ${files.length}  bytes(staged): ${bytes}  bytes(tgz): ${fs.statSync(tgzPath).size}`);
@@ -366,7 +408,7 @@ function apply(capsulePath, targetHome, dryRun) {
     fs.mkdirSync(claudeTarget, { recursive: true });
     extractDest = claudeTarget;
   }
-  const tar = spawnSync('tar', ['--force-local', '-xzf', fwd(capsulePath), '-C', fwd(extractDest)], { stdio: 'inherit' });
+  const tar = spawnSync('tar', tarArgs(['-xzf', fwd(capsulePath), '-C', fwd(extractDest)]), { stdio: 'inherit' });
   if (tar.status !== 0) { console.error('tar extract failed'); process.exit(1); }
   const manifestPath = path.join(extractDest, MANIFEST_NAME);
   const manifest = fs.existsSync(manifestPath) ? JSON.parse(fs.readFileSync(manifestPath, 'utf8')) : null;
@@ -529,7 +571,7 @@ const ENV_SCAN_EXTS = new Set(['.cjs', '.js', '.mjs', '.py', '.ps1']);
 const NON_SECRET_ENV = new Set(['TEMP', 'TMP', 'TMPDIR', 'HOME', 'PATH', 'PWD', 'OS', 'SHELL', 'USER', 'USERNAME',
   'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'SYSTEMROOT', 'COMSPEC', 'CI', 'NODE_ENV', 'BASH_ENV',
   'CLAUDE_PROJECT_DIR', 'CLAUDE_CODE_ENTRYPOINT']);
-function detectSecretNames(root) {
+function detectSecretNames(root, prefixes = CONFIG.secrets.defaultPrefixes) {
   const names = new Set();
   for (const sub of ['hooks', 'ext', 'scripts', 'tools']) {
     const dir = path.join(root, sub);
@@ -542,12 +584,14 @@ function detectSecretNames(root) {
   }
   const sp = path.join(root, 'settings.json');
   if (fs.existsSync(sp)) { try { Object.keys(JSON.parse(fs.readFileSync(sp, 'utf8')).env || {}).forEach((k) => names.add(k)); } catch { /* ignore */ } }
-  return [...names].filter((n) => n.startsWith('DASHCLAW_') || (!NON_SECRET_ENV.has(n) && !/_(HOME|DIR|PATH|FILE)$/.test(n))).sort();
+  // a configured prefix is an escape hatch past the suffix/denylist filter, not an extra condition on top of it
+  return [...names].filter((n) => prefixes.some((p) => n.startsWith(p))
+    || (!NON_SECRET_ENV.has(n) && !/_(HOME|DIR|PATH|FILE)$/.test(n))).sort();
 }
 function capsuleScanRoot(explicit) {
   if (explicit) return path.resolve(explicit);
   const staged = path.resolve('dist', 'stage');
-  return fs.existsSync(path.join(staged, 'settings.json')) ? staged : CLAUDE_HOME;
+  return fs.existsSync(path.join(staged, 'settings.json')) ? staged : path.join(HOME, '.claude');
 }
 const isSet = (n) => typeof process.env[n] === 'string' && process.env[n] !== '';
 function secretsList(root) {
@@ -562,12 +606,18 @@ function devboxBin() {
     ? path.join(HOME, 'AppData', 'Local', 'Programs', 'devbox', 'devbox.exe') : 'devbox');
 }
 function secretsPush(devboxName, wanted, root) {
-  // Default is the DASHCLAW_* slice of the detected set — the names this harness's hooks authenticate with.
+  // Default scope is the configured prefixes' slice of the detected set — the names this harness authenticates with.
   // The scan also finds unrelated live keys (Stripe/GitHub/Resend/...); those only go over if named explicitly.
+  const prefixes = CONFIG.secrets.defaultPrefixes;
+  if (!wanted.length && !prefixes.length) {
+    console.error('no secrets.defaultPrefixes configured — name the secrets to push explicitly'); process.exit(1);
+  }
   const detected = detectSecretNames(root);
-  const names = (wanted.length ? wanted : detected.filter((n) => n.startsWith('DASHCLAW_') && !/_(DIR|PATH|FILE)$/.test(n))).filter(isSet);
+  const names = (wanted.length ? wanted
+    : detected.filter((n) => prefixes.some((p) => n.startsWith(p)) && !/_(DIR|PATH|FILE)$/.test(n))).filter(isSet);
   if (!names.length) { console.error('no detected secret names are set in this shell — nothing to push'); process.exit(1); }
-  if (!wanted.length) console.log(`default scope: DASHCLAW_* (${detected.length} names detected; name others explicitly to push them)`);
+  if (!wanted.length) console.log(`default scope: ${prefixes.map((p) => p + '*').join(', ')} `
+    + `(${detected.length} names detected; name others explicitly to push them)`);
   const dir = fs.existsSync(SCRATCH_DIR) ? SCRATCH_DIR : os.tmpdir();
   const tmp = path.join(dir, `capsule-secrets-${process.pid}.sh`);
   const body = '#!/usr/bin/env bash\n# generated by `capsule secrets push` — sourced via settings.json env.BASH_ENV\n'
@@ -592,10 +642,16 @@ function secretsPush(devboxName, wanted, root) {
 }
 // ---------- release: pack, then publish the tarball as a (private) GitHub release asset ----------
 function release(outDir, dryRun) {
+  // checked before pack: packing a real home takes minutes, and a missing repo is a config error, not a pack failure
+  const repo = process.env.CAPSULE_REPO || CONFIG.release.repo;
+  if (!repo) { console.error('no release repo: set CAPSULE_REPO or release.repo in capsule.config.json'); process.exit(1); }
   pack(outDir);
   const tag = `capsule-${ts().slice(0, 13)}`;
-  const ghArgs = ['release', 'create', tag, fwd(path.join(outDir, 'capsule.tgz')), fwd(process.argv[1]),
-    '--repo', RELEASE_REPO, '--title', `capsule ${tag}`,
+  // the asset must be named capsule.mjs whatever path this script ran from (install.sh downloads it by name)
+  const scriptCopy = path.join(outDir, 'capsule.mjs');
+  fs.copyFileSync(fileURLToPath(import.meta.url), scriptCopy);
+  const ghArgs = ['release', 'create', tag, fwd(path.join(outDir, 'capsule.tgz')), fwd(scriptCopy),
+    '--repo', repo, '--title', `capsule ${tag}`,
     '--notes', `Claude Code harness capsule packed ${new Date().toISOString()}. Install: bootstrap/install.sh`];
   if (dryRun) { console.log('[dry-run] gh ' + ghArgs.map((a) => (/\s/.test(a) ? JSON.stringify(a) : a)).join(' ')); return; }
   // no shell: with shell:true on Windows the --title/--notes values get split on spaces
@@ -610,37 +666,46 @@ function parseArgs(argv) {
     if (a === '--out') out.out = argv[++i];
     else if (a === '--home') out.home = argv[++i];
     else if (a === '--stage') out.stage = argv[++i];
+    else if (a === '--config') out.config = argv[++i];
     else if (a === '--dry-run') out.dryRun = true;
     else if (a === '--apt') out.apt = true;
     else out._.push(a);
   }
   return out;
 }
-const args = parseArgs(process.argv.slice(2));
-const cmd = args._[0];
-if (cmd === 'pack') {
-  pack(path.resolve(args.out || 'dist'));
-} else if (cmd === 'apply') {
-  if (!args._[1]) { console.error('usage: capsule.mjs apply CAPSULE.tgz [--home DIR] [--dry-run]'); process.exit(1); }
-  apply(path.resolve(args._[1]), args.home ? path.resolve(args.home) : HOME, !!args.dryRun);
-} else if (cmd === 'doctor') {
-  const rows = runDoctor(args.home ? path.resolve(args.home) : HOME);
-  printDoctor(rows);
-  process.exit(rows.every(doctorPass) ? 0 : 1);
-} else if (cmd === 'provision') {
-  provision(args.home ? path.resolve(args.home) : HOME, { dryRun: !!args.dryRun, apt: !!args.apt });
-} else if (cmd === 'secrets') {
-  const sub = args._[1] || 'list', root = capsuleScanRoot(args.stage);
-  if (sub === 'list') secretsList(root);
-  else if (sub === 'push') {
-    if (!args._[2]) { console.error('usage: capsule.mjs secrets push DEVBOX [NAME...]'); process.exit(1); }
-    secretsPush(args._[2], args._.slice(3), root);
-  } else { console.error('usage: capsule.mjs secrets <list|push DEVBOX [NAME...]> [--stage DIR]'); process.exit(1); }
-} else if (cmd === 'release') {
-  release(path.resolve(args.out || 'dist'), !!args.dryRun);
-} else {
-  console.error('usage: capsule.mjs <pack [--out DIR]|apply CAPSULE.tgz [--home DIR] [--dry-run]|doctor [--home DIR]\n'
-    + '                    |provision [--home DIR] [--apt] [--dry-run]|secrets <list|push DEVBOX [NAME...]> [--stage DIR]\n'
-    + '                    |release [--out DIR] [--dry-run]>');
-  process.exit(1);
+function main(argv) {
+  const args = parseArgs(argv);
+  const cmd = args._[0];
+  if (args.config) { CONFIG = loadConfig(path.resolve(args.config)); RULES = makeRules(HOME, CONFIG); }
+  if (cmd === 'pack') {
+    // --home is the SOURCE home being packed; it defaults to ours
+    RULES = makeRules(args.home ? path.resolve(args.home) : HOME, CONFIG);
+    pack(path.resolve(args.out || 'dist'));
+  } else if (cmd === 'apply') {
+    if (!args._[1]) { console.error('usage: capsule.mjs apply CAPSULE.tgz [--home DIR] [--dry-run]'); process.exit(1); }
+    apply(path.resolve(args._[1]), args.home ? path.resolve(args.home) : HOME, !!args.dryRun);
+  } else if (cmd === 'doctor') {
+    const rows = runDoctor(args.home ? path.resolve(args.home) : HOME);
+    printDoctor(rows);
+    process.exit(rows.every(doctorPass) ? 0 : 1);
+  } else if (cmd === 'provision') {
+    provision(args.home ? path.resolve(args.home) : HOME, { dryRun: !!args.dryRun, apt: !!args.apt });
+  } else if (cmd === 'secrets') {
+    const sub = args._[1] || 'list', root = capsuleScanRoot(args.stage);
+    if (sub === 'list') secretsList(root);
+    else if (sub === 'push') {
+      if (!args._[2]) { console.error('usage: capsule.mjs secrets push DEVBOX [NAME...]'); process.exit(1); }
+      secretsPush(args._[2], args._.slice(3), root);
+    } else { console.error('usage: capsule.mjs secrets <list|push DEVBOX [NAME...]> [--stage DIR]'); process.exit(1); }
+  } else if (cmd === 'release') {
+    release(path.resolve(args.out || 'dist'), !!args.dryRun);
+  } else {
+    console.error('usage: capsule.mjs <pack [--out DIR] [--home DIR]|apply CAPSULE.tgz [--home DIR] [--dry-run]|doctor [--home DIR]\n'
+      + '                    |provision [--home DIR] [--apt] [--dry-run]|secrets <list|push DEVBOX [NAME...]> [--stage DIR]\n'
+      + '                    |release [--out DIR] [--dry-run]>   [--config capsule.config.json]');
+    process.exit(1);
+  }
 }
+// run the CLI only when executed directly, so importing this module for tests does nothing
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main(process.argv.slice(2));
+export { rewriteText, isExcludedName, scanForSecrets, detectSecretNames, loadConfig, makeRules };

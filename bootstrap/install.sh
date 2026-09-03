@@ -3,17 +3,28 @@
 #   devbox create <name> --dotfiles https://github.com/ucsandman/agent-capsule --setup_github
 # then run this script (Namespace runs dotfiles install.sh automatically when present).
 # Sources for capsule.tgz + capsule.mjs, in order: already in $DEST -> gh release -> $CAPSULE_URL -> dotfiles checkout.
+# The release repo is $CAPSULE_REPO, else release.repo from ../capsule.config.json; with neither, the gh rung is skipped.
 set -euo pipefail
-REPO="${CAPSULE_REPO:-ucsandman/agent-capsule}"
 DEST="${CAPSULE_DEST:-$HOME/capsule}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.local/node_modules/.bin:$PATH"
+command -v node >/dev/null 2>&1 || { echo "[capsule] ERROR: node is required"; exit 1; }
 mkdir -p "$DEST"
+
+CONFIG="$SCRIPT_DIR/../capsule.config.json"
+REPO="${CAPSULE_REPO:-}"
+if [ -z "$REPO" ] && [ -s "$CONFIG" ]; then
+  # || true: a missing or unparseable config must never abort the bootstrap under set -e
+  REPO="$(node -p "(function(){try{return (require('$CONFIG').release||{}).repo||''}catch(e){return ''}})()" 2>/dev/null || true)"
+fi
 
 if [ -s "$DEST/capsule.tgz" ] && [ -s "$DEST/capsule.mjs" ]; then
   echo "[capsule] found $DEST/capsule.tgz + capsule.mjs — skipping download"
 else
-  if command -v gh >/dev/null 2>&1 &&
+  if [ -z "$REPO" ]; then
+    echo "[capsule] no release repo (set CAPSULE_REPO or release.repo in capsule.config.json) — skipping the gh release download"
+  fi
+  if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1 &&
      gh release download --repo "$REPO" --pattern capsule.tgz --pattern capsule.mjs --dir "$DEST" --clobber >/dev/null 2>&1; then
     echo "[capsule] downloaded release assets from $REPO"
   elif [ -n "${CAPSULE_URL:-}" ] && curl -fsSL "$CAPSULE_URL" -o "$DEST/capsule.tgz"; then
@@ -29,7 +40,6 @@ if [ ! -s "$DEST/capsule.mjs" ]; then
 fi
 [ -s "$DEST/capsule.tgz" ] || { echo "[capsule] ERROR: no capsule.tgz (set CAPSULE_URL or publish a release)"; exit 1; }
 [ -s "$DEST/capsule.mjs" ] || { echo "[capsule] ERROR: no capsule.mjs"; exit 1; }
-command -v node >/dev/null 2>&1 || { echo "[capsule] ERROR: node is required"; exit 1; }
 
 if [ -s "$HOME/.claude/.capsule-manifest.json" ] && [ "${CAPSULE_FORCE:-0}" != "1" ]; then
   echo "[capsule] harness already applied (CAPSULE_FORCE=1 to re-apply)"

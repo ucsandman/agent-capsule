@@ -1,0 +1,9 @@
+{
+  "externalRoot": "C:/Projects",
+  "localPyPackages": {
+    "context_handoff_bundle": { "name": "context-handoff-bundle", "src": "~/clawd/projects/context-handoff-bundle" }
+  },
+  "extraExclusions": ["fleet", "superpowers", "tests"],
+  "release": { "repo": "ucsandman/agent-capsule-store" },
+  "secrets": { "defaultPrefixes": ["DASHCLAW_"] }
+}
